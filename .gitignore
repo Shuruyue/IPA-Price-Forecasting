@@ -1,0 +1,30 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# pytest
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Virtual environments
+.venv/
+venv/
+
+# Distribution
+*.egg-info/
+dist/
+build/
+
+# Private / regenerated data and outputs
+Code/Data/ipa_prices.json
+Code/Data/market_data_*.csv
+Code/figures/
+Code/reports/
