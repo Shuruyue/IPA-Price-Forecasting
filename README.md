@@ -4,6 +4,8 @@
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
+**Result.** On the original quarterly price series (2012–2024, not distributed), gradient-boosted trees tuned by walk-forward validation forecast the held-out quarters with a mean absolute percentage error of 2.3 %, against 9.1 % for SARIMA; with only about nine test quarters this is indicative rather than precise (details below).
+
 Quarterly price forecasting for isopropyl alcohol (IPA, TWD/kg), built as the final project of an
 Engineering Economics course. A tree-based model and SARIMA are tuned by walk-forward
 validation on 2012–2024 data, combined into an ensemble, and used to forecast 2025 and 2026
