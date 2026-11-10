@@ -65,24 +65,6 @@ class TestIsTargetDerivedFeature:
         assert not IPAPricePredictor._is_target_derived_feature('Year')
 
 
-class TestSafePctChange:
-    def test_normal(self):
-        values = np.array([40.0, 42.0, 44.0])
-        result = IPAPricePredictor._safe_pct_change(values, periods=1)
-        # (44 - 42) / 42
-        assert result == pytest.approx((44.0 - 42.0) / 42.0)
-
-    def test_too_short(self):
-        values = np.array([40.0])
-        result = IPAPricePredictor._safe_pct_change(values, periods=1)
-        assert result == 0.0
-
-    def test_zero_base(self):
-        values = np.array([0.0, 1.0])
-        result = IPAPricePredictor._safe_pct_change(values, periods=1)
-        assert result == 0.0
-
-
 class TestDirectionAccuracy:
     def test_perfect_direction(self):
         y_true = np.array([40.0, 42.0, 44.0, 46.0])
@@ -94,30 +76,13 @@ class TestDirectionAccuracy:
         result = IPAPricePredictor._direction_accuracy(np.array([40.0]), np.array([41.0]))
         assert result == 0.0
 
-
-# ---------------------------------------------------------------------------
-# Clip outliers
-# ---------------------------------------------------------------------------
-
-class TestClipOutliers:
-    def test_basic_clipping(self, predictor):
-        df = pd.DataFrame({
-            'a': [1, 2, 3, 100, 5, 6, 7, 8, 9, 10],
-            'b': [10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
-        })
-        result = predictor._clip_outliers(df, quantile_low=0.1, quantile_high=0.9)
-        assert result['a'].max() <= df['a'].quantile(0.9)
-
-    def test_exclude_cols(self, predictor):
-        df = pd.DataFrame({
-            'IPA_Price_TWD': [1, 2, 3, 100, 5],
-            'other': [1, 2, 3, 100, 5],
-        })
-        result = predictor._clip_outliers(df, exclude_cols=['IPA_Price_TWD'])
-        # Excluded column should remain unchanged
-        assert result['IPA_Price_TWD'].max() == 100
-        # Other column should be clipped
-        assert result['other'].max() <= df['other'].quantile(0.99)
+    def test_relative_to_previous_actual(self):
+        # one-quarter-ahead forecasts are judged against the last known price
+        y_prev = np.array([40.0, 42.0, 41.0])
+        y_true = np.array([42.0, 41.0, 43.0])   # up, down, up
+        y_pred = np.array([41.0, 43.0, 42.0])   # up, up,   up
+        result = IPAPricePredictor._direction_accuracy(y_true, y_pred, y_prev)
+        assert result == pytest.approx(200 / 3)
 
 
 # ---------------------------------------------------------------------------
@@ -188,89 +153,6 @@ class TestGetModelBlendWeights:
 
 
 # ---------------------------------------------------------------------------
-# Build future feature row
-# ---------------------------------------------------------------------------
-
-class TestBuildFutureFeatureRow:
-    def test_lag_features_populated(self, predictor):
-        feature_cols = ['IPA_Price_TWD_lag1', 'IPA_Price_TWD_lag2', 'Year', 'Quarter']
-        predictor.feature_cols = feature_cols
-        predictor.exogenous_feature_cols = []
-
-        template = pd.Series(
-            [0.0, 0.0, 2024, 4],
-            index=feature_cols,
-            dtype=float,
-        )
-        target_history = [40.0, 42.0, 44.0, 46.0]
-        future_period = pd.Period('2025Q1', freq='Q')
-
-        row = predictor._build_future_feature_row(future_period, target_history, template)
-
-        assert row['IPA_Price_TWD_lag1'] == 46.0  # last value
-        assert row['IPA_Price_TWD_lag2'] == 44.0  # second last
-        assert row['Year'] == 2025
-        assert row['Quarter'] == 1
-
-    def test_exogenous_derived_recomputed(self, predictor):
-        predictor.feature_cols = [
-            'IPA_Price_TWD_lag1',
-            'WTI_Price',
-            'WTI_Price_lag1',
-            'WTI_Price_ma2',
-            'USD_TWD',
-            'WTI_Price_x_USD_TWD',
-            'Year',
-            'Quarter',
-        ]
-        predictor.base_exogenous_feature_cols = ['WTI_Price', 'USD_TWD']
-
-        template = pd.Series([0.0] * len(predictor.feature_cols), index=predictor.feature_cols, dtype=float)
-        target_history = [40.0, 42.0, 44.0, 46.0]
-        future_period = pd.Period('2025Q1', freq='Q')
-        exog_history = pd.DataFrame(
-            {
-                'WTI_Price': [70.0, 72.0, 75.0],
-                'USD_TWD': [31.0, 31.2, 31.5],
-            },
-            index=pd.date_range('2024-06-30', periods=3, freq='QE'),
-        )
-        exog_values = pd.Series({'WTI_Price': 75.0, 'USD_TWD': 31.5})
-
-        row = predictor._build_future_feature_row(
-            future_period,
-            target_history,
-            template,
-            exogenous_values=exog_values,
-            exogenous_history=exog_history,
-        )
-        assert row['WTI_Price'] == pytest.approx(75.0)
-        assert row['WTI_Price_lag1'] == pytest.approx(72.0)
-        assert row['WTI_Price_ma2'] == pytest.approx((72.0 + 75.0) / 2)
-        assert row['WTI_Price_x_USD_TWD'] == pytest.approx(75.0 * 31.5)
-
-    def test_rolling_stats_computed(self, predictor):
-        """Test that rolling std/max/min features are correctly computed."""
-        predictor.feature_cols = [
-            'IPA_Price_TWD_lag1', 'IPA_Price_TWD_ma2',
-            'IPA_Price_TWD_std2', 'IPA_Price_TWD_max2', 'IPA_Price_TWD_min2',
-            'Year', 'Quarter',
-        ]
-        predictor.exogenous_feature_cols = []
-        predictor.base_exogenous_feature_cols = []
-
-        template = pd.Series([0.0] * len(predictor.feature_cols), index=predictor.feature_cols, dtype=float)
-        target_history = [40.0, 42.0, 44.0, 46.0]
-        future_period = pd.Period('2025Q1', freq='Q')
-
-        row = predictor._build_future_feature_row(future_period, target_history, template)
-        assert row['IPA_Price_TWD_ma2'] == pytest.approx(np.mean([44.0, 46.0]))
-        assert row['IPA_Price_TWD_std2'] == pytest.approx(np.std([44.0, 46.0], ddof=0))
-        assert row['IPA_Price_TWD_max2'] == pytest.approx(46.0)
-        assert row['IPA_Price_TWD_min2'] == pytest.approx(44.0)
-
-
-# ---------------------------------------------------------------------------
 # JSON serialization utility
 # ---------------------------------------------------------------------------
 
@@ -305,3 +187,66 @@ class TestModuleConstants:
 
     def test_weight_power_positive(self):
         assert ENSEMBLE_WEIGHT_POWER > 0
+
+
+# ---------------------------------------------------------------------------
+# End to end, offline: synthetic sample prices and synthetic market data
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def offline_run(tmp_path, monkeypatch):
+    from ipa_data_collector import IPADataCollector
+    from ipa_feature_engineering import SAMPLE_IPA_JSON_PATH
+
+    days = pd.date_range('2012-01-01', '2024-12-31', freq='D')
+    rng = np.random.default_rng(3)
+    market = pd.DataFrame(
+        {col: 50 + np.cumsum(rng.normal(0, 0.5, len(days))) for col in IPADataCollector.MARKET_COLUMNS},
+        index=days,
+    )
+    for col in IPADataCollector.EVENT_COLUMNS:
+        market[col] = (days.year >= 2020).astype(int)
+    monkeypatch.setattr(IPADataCollector, 'collect_all_data', lambda self: market.copy())
+
+    p = IPAPricePredictor(
+        target_year=2025, price_file=SAMPLE_IPA_JSON_PATH, cache_dir=str(tmp_path),
+        figures_dir=str(tmp_path / 'fig'), reports_dir=str(tmp_path / 'rep'),
+    )
+    p.load_and_prepare_data()
+    p.train_models(test_size=0.2)
+    forecast = p.predict_future(quarters_ahead=4)
+    return p, forecast
+
+
+class TestEndToEndOffline:
+    def test_features_are_past_only_columns(self, offline_run):
+        p, _ = offline_run
+        raw = set(p.quarterly_base.columns)
+        assert not raw & set(p.feature_cols)  # no quarter-t price or driver is a feature
+
+    def test_all_models_and_naive_baseline_reported(self, offline_run):
+        p, _ = offline_run
+        keys = {r['ModelKey'] for r in p.results}
+        assert {'xgboost', 'sarima', 'naive', 'ensemble'} <= keys
+        n_test = len(p.y_test)
+        assert all(np.isfinite(r['MAPE']) for r in p.results)
+        assert len(p.predictions['sarima_test']) == n_test  # one-step forecasts, one per quarter
+
+    def test_forecast_models_use_all_quarters(self, offline_run):
+        p, forecast = offline_run
+        # SARIMA used to forecast from the end of the training split, ~9 quarters too early
+        assert p.models['sarima'].fitted_model.nobs == len(p.y)
+        assert list(forecast['Quarter']) == ['2025Q1', '2025Q2', '2025Q3', '2025Q4']
+        assert np.isfinite(forecast[['Base', 'Optimistic', 'Pessimistic']].to_numpy()).all()
+
+    def test_first_forecast_uses_observed_data_only(self, offline_run):
+        p, forecast = offline_run
+        # The first forecast quarter needs no projected value: its features come from 2024 and
+        # earlier, built by the same function as the training rows.
+        table = p.quarterly_base.copy()
+        q1 = pd.Timestamp('2025-03-31')
+        table.loc[q1] = np.nan
+        features = p.feature_engineer.build_quarterly_features(table).loc[q1, p.feature_cols]
+        assert not features.isna().any()
+        expected = float(p.models['xgboost'].predict(features.to_numpy(dtype=float).reshape(1, -1))[0])
+        assert forecast['XGBoost'].iloc[0] == pytest.approx(expected)

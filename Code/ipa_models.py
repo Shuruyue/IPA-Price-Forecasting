@@ -61,18 +61,39 @@ class ModelEvaluator:
     """Model evaluation metrics calculator."""
 
     @staticmethod
-    def evaluate(y_true: np.ndarray, y_pred: np.ndarray, model_name: str = "Model") -> Dict[str, Any]:
+    def direction_accuracy(
+        y_true: np.ndarray, y_pred: np.ndarray, y_prev: Optional[np.ndarray] = None,
+    ) -> float:
+        """Share (%) of quarters whose direction of change is predicted correctly.
+
+        With *y_prev* (the actual value of the quarter before each target), a forecast is
+        right when it moves away from the last known price in the same direction as the
+        actual price did; this is the question a one-quarter-ahead forecast answers. Without
+        it, consecutive predictions are compared with consecutive actual values.
+        """
+        y_true = np.asarray(y_true, dtype=float)
+        y_pred = np.asarray(y_pred, dtype=float)
+        if y_prev is not None:
+            y_prev = np.asarray(y_prev, dtype=float)
+            if y_true.size == 0:
+                return 0.0
+            return float(np.mean(np.sign(y_true - y_prev) == np.sign(y_pred - y_prev)) * 100)
+        if y_true.size <= 1:
+            return 0.0
+        return float(np.mean((np.diff(y_true) > 0) == (np.diff(y_pred) > 0)) * 100)
+
+    @staticmethod
+    def evaluate(
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        model_name: str = "Model",
+        y_prev: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
         """Calculate evaluation metrics (MAE, RMSE, MAPE, Direction Accuracy)."""
         mae = mean_absolute_error(y_true, y_pred)
         rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
         mape = mean_absolute_percentage_error(y_true, y_pred) * 100
-
-        if len(y_true) > 1:
-            true_direction = np.diff(y_true) > 0
-            pred_direction = np.diff(y_pred) > 0
-            direction_acc = float(np.mean(true_direction == pred_direction) * 100)
-        else:
-            direction_acc = 0.0
+        direction_acc = ModelEvaluator.direction_accuracy(y_true, y_pred, y_prev)
 
         return {
             'Model': model_name,
@@ -135,6 +156,22 @@ class ARIMAModel:
         if self.fitted_model is None:
             raise ValueError("Model not trained yet")
         return self.fitted_model.forecast(steps=steps, exog=exog)
+
+    def one_step_ahead(self, y_full: np.ndarray, start: int) -> np.ndarray:
+        """One-quarter-ahead predictions of y_full[start:] with the fitted parameters.
+
+        The model must have been fitted on y_full[:start]. The fitted parameters are applied
+        to the longer series without refitting, and the prediction for each quarter uses the
+        observations before that quarter only (Kalman filter one-step predictions).
+        """
+        if self.fitted_model is None:
+            raise ValueError("Model not trained yet")
+        y_full = np.asarray(y_full, dtype=float)
+        if not 0 < start < y_full.size:
+            raise ValueError(f"start must be in (0, {y_full.size}), got {start}")
+        extended = self.fitted_model.apply(y_full)
+        prediction = extended.get_prediction(start=start, end=y_full.size - 1, dynamic=False)
+        return np.asarray(prediction.predicted_mean, dtype=float)
 
     def get_fitted_values(self) -> np.ndarray:
         """Get in-sample fitted values."""

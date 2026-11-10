@@ -8,7 +8,6 @@ import argparse
 import json
 import logging
 import os
-import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -71,20 +70,12 @@ SENSITIVITY_KEY_FEATURES: List[str] = [
 
 
 class IPAPricePredictor:
-    TIME_FEATURES = {
-        'Year', 'Quarter', 'Month', 'Week',
-        'Month_sin', 'Month_cos', 'Quarter_sin', 'Quarter_cos',
-    }
+    TIME_FEATURES = {'Quarter_sin', 'Quarter_cos'}
     BASE_EXOGENOUS_FEATURES = tuple(
         IPAFeatureEngineer.EXOGENOUS_COLS + IPADataCollector.EVENT_COLUMNS
     )
     EVENT_FEATURE_KEYWORDS = {
         'COVID19', 'Ukraine_War', 'RedSea_Crisis', 'US_China_Trade', 'Geopolitical_Risk',
-    }
-    TARGET_CHANGE_PERIODS = {
-        'pct_change': 1,
-        'monthly_change': 2,
-        'quarterly_change': 4,
     }
 
     def __init__(
@@ -113,7 +104,11 @@ class IPAPricePredictor:
         self.random_seed = random_seed
 
         self.data: Optional[pd.DataFrame] = None
+        self.quarterly_base: Optional[pd.DataFrame] = None
         self.quarterly_data: Optional[pd.DataFrame] = None
+        self.feature_engineer = IPAFeatureEngineer()
+        self.best_params: Dict[str, Any] = {}
+        self.y_test_prev: Optional[np.ndarray] = None
         self.models: Dict[str, Any] = {}
         self.predictions: Dict[str, np.ndarray] = {}
         self.results: List[Dict[str, Any]] = []
@@ -132,6 +127,7 @@ class IPAPricePredictor:
         self.model_display_names: Dict[str, str] = {
             'xgboost': 'XGBoost',
             'sarima': 'SARIMA',
+            'naive': 'Naive (last quarter)',
             'ensemble': 'Ensemble',
         }
         self.generated_at: str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -163,22 +159,8 @@ class IPAPricePredictor:
         return feature_name.startswith('IPA_Price_TWD_')
 
     @staticmethod
-    def _direction_accuracy(y_true, y_pred) -> float:
-        y_true = np.asarray(y_true, dtype=float)
-        y_pred = np.asarray(y_pred, dtype=float)
-        if y_true.size <= 1:
-            return 0.0
-        true_direction = np.diff(y_true) > 0
-        pred_direction = np.diff(y_pred) > 0
-        return float(np.mean(true_direction == pred_direction) * 100)
-
-    @staticmethod
-    def _safe_pct_change(values, periods: int) -> float:
-        values = np.asarray(values, dtype=float)
-        if values.size <= periods:
-            return 0.0
-        base = values[-(periods + 1)]
-        return 0.0 if abs(base) < 1e-6 else float((values[-1] - base) / base)
+    def _direction_accuracy(y_true, y_pred, y_prev=None) -> float:
+        return ModelEvaluator.direction_accuracy(y_true, y_pred, y_prev)
 
     @staticmethod
     def _json_compatible(value):
@@ -195,23 +177,6 @@ class IPAPricePredictor:
     # ------------------------------------------------------------------
     # Data preparation
     # ------------------------------------------------------------------
-
-    def _clip_outliers(
-        self,
-        df: pd.DataFrame,
-        quantile_low: float = 0.01,
-        quantile_high: float = 0.99,
-        exclude_cols: Optional[List[str]] = None,
-    ) -> pd.DataFrame:
-        exclude = set(exclude_cols or [])
-        result = df.copy()
-        for col in result.select_dtypes(include=[np.number]).columns:
-            if col in exclude:
-                continue
-            lower = result[col].quantile(quantile_low)
-            upper = result[col].quantile(quantile_high)
-            result[col] = result[col].clip(lower=lower, upper=upper)
-        return result
 
     def load_and_prepare_data(self) -> IPAPricePredictor:
         print("\n" + "=" * 60)
@@ -232,9 +197,11 @@ class IPAPricePredictor:
         self.ensemble_weights = {}
 
         feature_engineer = IPAFeatureEngineer()
+        self.feature_engineer = feature_engineer
 
-        print("\n[1/4] Creating IPA price data...")
-        ipa_data = feature_engineer.create_ipa_price_data(json_path=self.price_file)
+        print("\n[1/4] Loading IPA prices...")
+        monthly_prices = feature_engineer.load_monthly_prices(json_path=self.price_file)
+        quarterly_target = feature_engineer.quarterly_target(monthly_prices)
 
         print("\n[2/4] Collecting external data...")
         collector = IPADataCollector(
@@ -246,23 +213,23 @@ class IPAPricePredictor:
         )
         external_data = collector.collect_all_data()
 
-        print("\n[3/4] Merging data...")
-        if external_data is None or external_data.empty:
-            self.data = ipa_data.copy()
-        else:
-            self.data = ipa_data.join(external_data, how='left')
-        self.data = self.data.sort_index().ffill()
-        self.data = self._clip_outliers(self.data, exclude_cols=['IPA_Price_TWD'])
+        print("\n[3/4] Building the quarterly table...")
+        # Target = mean of the three monthly prices; drivers = quarterly means of daily data.
+        # Nothing is interpolated or clipped across quarters, so no quarter sees later data.
+        base = quarterly_target.to_frame()
+        self.data = external_data
+        if external_data is not None and not external_data.empty:
+            base = base.join(feature_engineer.resample_to_quarterly(external_data), how='left')
+        self.quarterly_base = base.sort_index()
 
         print("\n[4/4] Feature engineering...")
-        quarterly_base = feature_engineer.resample_to_quarterly(self.data).sort_index()
         self.quarterly_data = feature_engineer.prepare_quarterly_features(
-            quarterly_base, target_col='IPA_Price_TWD',
+            self.quarterly_base, target_col='IPA_Price_TWD',
         ).sort_index()
 
         print("\n[OK] Data preparation complete")
-        print(f"  Weekly merged data: {len(self.data)} records")
-        print(f"  Quarterly data: {len(self.quarterly_data)} records")
+        print(f"  Quarters with a price: {len(self.quarterly_base)}")
+        print(f"  Quarters with all features: {len(self.quarterly_data)}")
         return self
 
     # ------------------------------------------------------------------
@@ -291,7 +258,10 @@ class IPAPricePredictor:
                 continue
 
             y_train, y_val = y[train_idx], y[val_idx]
+            y_prev = y[val_idx - 1]
 
+            # Every model forecasts one quarter ahead from the actual history, as the tree
+            # model's lag features do, so the CV errors are comparable.
             try:
                 if model_key == 'xgboost':
                     model = XGBoostModel(**params)
@@ -300,7 +270,9 @@ class IPAPricePredictor:
                 elif model_key == 'sarima':
                     model = ARIMAModel(order=params['order'], seasonal_order=params['seasonal_order'])
                     model.fit(y_train)
-                    pred = np.asarray(model.predict(len(val_idx)), dtype=float)
+                    pred = model.one_step_ahead(y[:val_idx[-1] + 1], start=int(val_idx[0]))
+                elif model_key == 'naive':
+                    pred = y_prev.astype(float)
                 else:
                     raise ValueError(f"Unsupported model_key for backtest: {model_key}")
             except Exception as e:
@@ -315,7 +287,7 @@ class IPAPricePredictor:
                 'MAE': float(np.mean(np.abs(y_val - pred))),
                 'RMSE': float(np.sqrt(np.mean((y_val - pred) ** 2))),
                 'MAPE': self._safe_mape(y_val, pred),
-                'Direction_Accuracy': self._direction_accuracy(y_val, pred),
+                'Direction_Accuracy': self._direction_accuracy(y_val, pred, y_prev),
             })
 
         if not fold_rows:
@@ -447,7 +419,9 @@ class IPAPricePredictor:
         self.results = [r for r in self.results if r.get('ModelKey') != 'ensemble']
         ensemble_test = self._blend_predictions('xgboost_test', 'sarima_test')
 
-        ensemble_results = ModelEvaluator.evaluate(self.y_test, ensemble_test, self.model_display_names['ensemble'])
+        ensemble_results = ModelEvaluator.evaluate(
+            self.y_test, ensemble_test, self.model_display_names['ensemble'], y_prev=self.y_test_prev,
+        )
         ensemble_results['ModelKey'] = 'ensemble'
         self.results.append(ensemble_results)
         ModelEvaluator.print_results(ensemble_results)
@@ -484,8 +458,9 @@ class IPAPricePredictor:
 
         df = self.quarterly_data.copy()
         target_col = 'IPA_Price_TWD'
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        feature_cols = [c for c in numeric_cols if c != target_col]
+        # quarterly_data holds the target and the features only; every feature of a quarter
+        # is built from earlier quarters (ipa_feature_engineering.build_quarterly_features)
+        feature_cols = [c for c in df.columns if c != target_col]
         if not feature_cols:
             raise ValueError("No numeric feature columns available for training.")
 
@@ -498,18 +473,20 @@ class IPAPricePredictor:
 
         X_train, X_test = X[:split_idx], X[split_idx:]
         y_train, y_test = y[:split_idx], y[split_idx:]
+        y_prev = y[split_idx - 1:-1]  # actual price of the quarter before each test quarter
         print(f"\nTraining set: {len(X_train)} records")
-        print(f"Test set: {len(X_test)} records")
+        print(f"Test set: {len(X_test)} records (each forecast one quarter ahead)")
 
         # --- XGBoost ---
         print("\n" + "-" * 40)
         print("Training XGBoost model...")
         xgb_model, best_params, xgb_cv_summary, xgb_cv_rows = self._fit_xgboost_with_cv(X_train, y_train)
+        self.best_params['xgboost'] = best_params
         xgb_pred = xgb_model.predict(X_test)
         xgb_name = xgb_model.get_display_name()
         self.model_display_names['xgboost'] = xgb_name
 
-        xgb_results = ModelEvaluator.evaluate(y_test, xgb_pred, xgb_name)
+        xgb_results = ModelEvaluator.evaluate(y_test, xgb_pred, xgb_name, y_prev=y_prev)
         xgb_results['ModelKey'] = 'xgboost'
         xgb_results['CV_MAPE'] = xgb_cv_summary.get('CV_MAPE')
         xgb_results['CV_RMSE'] = xgb_cv_summary.get('CV_RMSE')
@@ -531,8 +508,10 @@ class IPAPricePredictor:
         print("Training SARIMA model...")
         try:
             arima_model, sarima_params, sarima_cv_summary, sarima_cv_rows = self._fit_sarima_with_cv(y_train)
-            arima_pred_array = np.asarray(arima_model.predict(len(y_test)), dtype=float)
-            arima_results = ModelEvaluator.evaluate(y_test, arima_pred_array, "SARIMA")
+            self.best_params['sarima'] = sarima_params
+            # one quarter ahead with the parameters fitted on the training quarters, like XGBoost
+            arima_pred_array = arima_model.one_step_ahead(y, start=split_idx)
+            arima_results = ModelEvaluator.evaluate(y_test, arima_pred_array, "SARIMA", y_prev=y_prev)
             arima_results['ModelKey'] = 'sarima'
             arima_results['CV_MAPE'] = sarima_cv_summary.get('CV_MAPE')
             arima_results['CV_RMSE'] = sarima_cv_summary.get('CV_RMSE')
@@ -549,19 +528,49 @@ class IPAPricePredictor:
             logger.warning("SARIMA training failed: %s", e)
             print(f"SARIMA training failed: {e}")
 
+        # --- Naive baseline: next quarter = this quarter ---
+        naive_cv_summary, naive_cv_rows = self._walk_forward_backtest(y_train, model_key='naive', params={})
+        naive_results = ModelEvaluator.evaluate(y_test, y_prev, self.model_display_names['naive'], y_prev=y_prev)
+        naive_results['ModelKey'] = 'naive'
+        # "no change" has no direction, so direction accuracy is not defined for this baseline
+        naive_results['Direction_Accuracy'] = float('nan')
+        naive_results['CV_MAPE'] = naive_cv_summary.get('CV_MAPE')
+        naive_results['CV_RMSE'] = naive_cv_summary.get('CV_RMSE')
+        naive_results['CV_Direction_Accuracy'] = float('nan')
+        naive_results['CV_Folds'] = naive_cv_summary.get('CV_Folds')
+        self.results.append(naive_results)
+        for fold_row in naive_cv_rows:
+            self.backtest_results.append({**fold_row, 'Model': self.model_display_names['naive']})
+        ModelEvaluator.print_results(naive_results)
+
         self.X, self.y, self.y_test, self.feature_cols = X, y, y_test, feature_cols
+        self.y_test_prev = y_prev
         self.exogenous_feature_cols = [
             c for c in self.feature_cols
             if (not self._is_target_derived_feature(c)) and (c not in self.TIME_FEATURES)
         ]
+        # raw quarterly drivers, projected forward when forecasting
         self.base_exogenous_feature_cols = [
-            c for c in self.feature_cols if c in self.BASE_EXOGENOUS_FEATURES
-        ]
+            c for c in self.quarterly_base.columns if c != target_col
+        ] if self.quarterly_base is not None else []
         self._derive_ensemble_weights()
 
         print("\n" + "-" * 40)
         print("Evaluating Ensemble model...")
         self._evaluate_ensemble_on_test()
+
+        # The test quarters were for evaluation only; the forecasts use models refitted on all
+        # quarters, so they start from the last observed quarter.
+        print("\n" + "-" * 40)
+        print("Refitting the selected models on all quarters for forecasting...")
+        final_xgb = XGBoostModel(**self.best_params['xgboost']).fit(X, y)
+        self.models['xgboost'] = final_xgb
+        self.feature_importance_df = final_xgb.get_feature_importance(feature_cols)
+        if 'sarima' in self.models:
+            params = self.best_params['sarima']
+            self.models['sarima'] = ARIMAModel(
+                order=params['order'], seasonal_order=params['seasonal_order'],
+            ).fit(y)
 
         print("\n" + "-" * 40)
         print("Sensitivity analysis...")
@@ -624,7 +633,7 @@ class IPAPricePredictor:
         if not self.base_exogenous_feature_cols:
             return pd.DataFrame(index=pd.PeriodIndex(future_periods, freq='Q'))
 
-        history_df = self.quarterly_data[self.base_exogenous_feature_cols].copy()
+        history_df = self.quarterly_base[self.base_exogenous_feature_cols].copy()
         forecast_index = pd.PeriodIndex(future_periods, freq='Q')
         projection = pd.DataFrame(
             index=forecast_index,
@@ -657,126 +666,6 @@ class IPAPricePredictor:
 
         return projection.ffill().bfill().fillna(0.0)
 
-    def _update_exogenous_derived_features(
-        self,
-        row: pd.Series,
-        exogenous_history: Optional[pd.DataFrame],
-    ) -> pd.Series:
-        if exogenous_history is None or exogenous_history.empty:
-            return row
-
-        latest = exogenous_history.iloc[-1]
-        previous = exogenous_history.iloc[-2] if len(exogenous_history) >= 2 else latest
-        rolling_windows = [2, 4, 8]
-
-        for col in self.base_exogenous_feature_cols:
-            if col in row.index and col in latest.index:
-                row[col] = float(latest[col])
-
-            lag_col = f'{col}_lag1'
-            if lag_col in row.index and col in previous.index:
-                row[lag_col] = float(previous[col])
-
-            if col not in exogenous_history.columns:
-                continue
-            series = exogenous_history[col].dropna().astype(float).to_numpy(dtype=float)
-            for w in rolling_windows:
-                ma_col = f'{col}_ma{w}'
-                if ma_col not in row.index:
-                    continue
-                d = series[-w:] if series.size >= w else series
-                row[ma_col] = float(np.mean(d)) if d.size else 0.0
-
-        for col_a, col_b in IPAFeatureEngineer.INTERACTION_PAIRS:
-            interaction_col = f'{col_a}_x_{col_b}'
-            if interaction_col in row.index and col_a in row.index and col_b in row.index:
-                row[interaction_col] = float(row[col_a]) * float(row[col_b])
-
-        return row
-
-    def _build_future_feature_row(
-        self,
-        future_period,
-        target_history: List[float],
-        template_row: pd.Series,
-        exogenous_values: Optional[pd.Series] = None,
-        exogenous_history: Optional[pd.DataFrame] = None,
-    ) -> pd.Series:
-        row = template_row.copy()
-        history = np.asarray(target_history, dtype=float)
-        ts = future_period.to_timestamp(how='end')
-
-        # Set base exogenous values
-        if exogenous_values is not None:
-            for col in self.base_exogenous_feature_cols:
-                if col in row.index and col in exogenous_values.index:
-                    row[col] = float(exogenous_values[col])
-
-        # Set time features
-        if 'Year' in row.index:
-            row['Year'] = ts.year
-        if 'Quarter' in row.index:
-            row['Quarter'] = future_period.quarter
-        if 'Month' in row.index:
-            row['Month'] = ts.month
-        if 'Week' in row.index:
-            row['Week'] = int(ts.isocalendar().week)
-        if 'Month_sin' in row.index:
-            row['Month_sin'] = np.sin(2 * np.pi * ts.month / 12)
-        if 'Month_cos' in row.index:
-            row['Month_cos'] = np.cos(2 * np.pi * ts.month / 12)
-        if 'Quarter_sin' in row.index:
-            row['Quarter_sin'] = np.sin(2 * np.pi * future_period.quarter / 4)
-        if 'Quarter_cos' in row.index:
-            row['Quarter_cos'] = np.cos(2 * np.pi * future_period.quarter / 4)
-
-        # Recompute target-derived features from history
-        for col in row.index:
-            lag_match = re.fullmatch(r'IPA_Price_TWD_lag(\d+)', col)
-            if lag_match:
-                lag = int(lag_match.group(1))
-                if history.size >= lag:
-                    row[col] = history[-lag]
-                continue
-
-            ma_match = re.fullmatch(r'IPA_Price_TWD_ma(\d+)', col)
-            if ma_match:
-                w = int(ma_match.group(1))
-                d = history[-w:] if history.size >= w else history
-                row[col] = float(np.mean(d)) if d.size else 0.0
-                continue
-
-            std_match = re.fullmatch(r'IPA_Price_TWD_std(\d+)', col)
-            if std_match:
-                w = int(std_match.group(1))
-                d = history[-w:] if history.size >= w else history
-                row[col] = float(np.std(d, ddof=0)) if d.size else 0.0
-                continue
-
-            max_match = re.fullmatch(r'IPA_Price_TWD_max(\d+)', col)
-            if max_match:
-                w = int(max_match.group(1))
-                d = history[-w:] if history.size >= w else history
-                row[col] = float(np.max(d)) if d.size else 0.0
-                continue
-
-            min_match = re.fullmatch(r'IPA_Price_TWD_min(\d+)', col)
-            if min_match:
-                w = int(min_match.group(1))
-                d = history[-w:] if history.size >= w else history
-                row[col] = float(np.min(d)) if d.size else 0.0
-                continue
-
-            if col == 'IPA_Price_TWD_pct_change':
-                row[col] = self._safe_pct_change(history, periods=self.TARGET_CHANGE_PERIODS['pct_change'])
-            elif col == 'IPA_Price_TWD_monthly_change':
-                row[col] = self._safe_pct_change(history, periods=self.TARGET_CHANGE_PERIODS['monthly_change'])
-            elif col == 'IPA_Price_TWD_quarterly_change':
-                row[col] = self._safe_pct_change(history, periods=self.TARGET_CHANGE_PERIODS['quarterly_change'])
-
-        row = self._update_exogenous_derived_features(row, exogenous_history)
-        return row.reindex(self.feature_cols).fillna(0.0).astype(float)
-
     def predict_future(self, quarters_ahead: int = 4) -> pd.DataFrame:
         print("\n" + "=" * 60)
         print(f"Predicting {self.target_year} Q1-Q4")
@@ -786,34 +675,27 @@ class IPAPricePredictor:
         predictions: Dict[str, Any] = {}
         exog_projection = self._project_exogenous_features(all_periods)
 
-        exog_history = pd.DataFrame()
-        if self.base_exogenous_feature_cols:
-            exog_history = self.quarterly_data[self.base_exogenous_feature_cols].copy()
-
         # --- XGBoost recursive prediction ---
+        # Each future quarter is appended to the quarterly table (price unknown, drivers
+        # projected) and its features are built by the same function as in training; the
+        # prediction then becomes the price of that quarter for the next step.
         if 'xgboost' in self.models:
             xgb_path: List[float] = []
-            target_history = self.y.tolist()
-            template_row = self.quarterly_data[self.feature_cols].iloc[-1].copy()
-
+            table = self.quarterly_base.copy()
             for period in all_periods:
-                exogenous_values = exog_projection.loc[period] if not exog_projection.empty else None
-                if exogenous_values is not None and not exog_history.empty:
-                    period_ts = period.to_timestamp(how='end')
-                    exog_history.loc[period_ts] = (
-                        exogenous_values.reindex(self.base_exogenous_feature_cols).to_numpy(dtype=float)
-                    )
-                feature_row = self._build_future_feature_row(
-                    period, target_history, template_row,
-                    exogenous_values=exogenous_values,
-                    exogenous_history=exog_history,
-                )
-                next_pred = float(
-                    self.models['xgboost'].predict(feature_row.to_numpy(dtype=float).reshape(1, -1))[0]
-                )
+                period_end = period.to_timestamp(how='end').normalize()
+                new_row = pd.Series(np.nan, index=table.columns, dtype=float)
+                if not exog_projection.empty:
+                    projected = exog_projection.loc[period]
+                    for col in self.base_exogenous_feature_cols:
+                        if col in projected.index:
+                            new_row[col] = float(projected[col])
+                table.loc[period_end] = new_row
+                features = self.feature_engineer.build_quarterly_features(table).loc[period_end]
+                feature_row = features.reindex(self.feature_cols).to_numpy(dtype=float).reshape(1, -1)
+                next_pred = float(self.models['xgboost'].predict(feature_row)[0])
+                table.loc[period_end, 'IPA_Price_TWD'] = next_pred
                 xgb_path.append(next_pred)
-                target_history.append(next_pred)
-                template_row = feature_row.copy()
             predictions['xgboost'] = xgb_path[step_offset:step_offset + quarters_ahead]
 
         # --- SARIMA prediction ---

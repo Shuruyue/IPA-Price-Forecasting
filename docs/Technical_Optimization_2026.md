@@ -1,5 +1,12 @@
 # IPA Forecasting Technical Optimization Note (2026-03-04)
 
+> **Note (2026-11).** The holdout figures in this note (1.72 %, 2.31 %) are not valid. The
+> quarterly rolling statistics and percentage changes of the price still included the quarter
+> being forecast, and the market drivers were that quarter's averages, so the features contained
+> the target. The rework below correctly suspected a time-alignment problem but did not remove it.
+> The pipeline now builds every feature from earlier quarters only; see the README section
+> "Correction of earlier results". This note is kept as a record of the March 2026 work.
+
 ## 1) Why this rework was needed
 
 Baseline run (before this rework) showed a large mismatch between cross-validation and holdout:
