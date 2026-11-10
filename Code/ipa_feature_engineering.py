@@ -1,13 +1,17 @@
 """
 IPA Price Prediction Model - Feature Engineering Module
-Feature Engineering for Isopropyl Alcohol Price Prediction
 
-This module is responsible for:
-- Loading the monthly IPA price series from a JSON file
-- Creating lag features
-- Creating rolling statistics features
-- Seasonal features
-- Data normalization
+Builds the quarterly modelling table:
+
+- the target of quarter t is the mean of the three monthly IPA prices of quarter t
+  (no interpolation, so no later month can enter it);
+- every feature of quarter t uses only quarters up to t-1 (target lags, rolling statistics
+  and changes of past prices, lagged market drivers and event indicators, the calendar
+  quarter), so a model fitted on these rows is applied exactly as it would be at the end
+  of quarter t-1.
+
+Training and forecasting both call build_quarterly_features(), so the features a model
+is trained on and the features it is given when forecasting are the same by construction.
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -36,11 +40,12 @@ SAMPLE_IPA_JSON_PATH = os.path.join(
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-DEFAULT_LAG_PERIODS: List[int] = [1, 2, 3, 4]
-DEFAULT_WEEKLY_ROLLING_WINDOWS: List[int] = [4, 8, 12]
-DEFAULT_QUARTERLY_ROLLING_WINDOWS: List[int] = [2, 4, 8]
-DEFAULT_EXOGENOUS_WINDOWS: List[int] = [4, 8]
-DEFAULT_QUARTERLY_EXOGENOUS_WINDOWS: List[int] = [2, 4]
+TARGET_COL = 'IPA_Price_TWD'
+TARGET_LAGS: List[int] = [1, 2, 3, 4]
+TARGET_WINDOWS: List[int] = [2, 4, 8]
+# change of the price over the k quarters before the forecast quarter
+TARGET_CHANGES: Dict[str, int] = {'chg1': 1, 'chg2': 2, 'chg4': 4}
+EXOGENOUS_WINDOWS: List[int] = [2, 4]
 
 EXOGENOUS_COLS: List[str] = [
     'WTI_Price', 'Brent_Price', 'NatGas_Price',
@@ -64,6 +69,7 @@ class IPAFeatureEngineer:
     def __init__(self) -> None:
         self.scaler = StandardScaler()
         self.target_scaler = MinMaxScaler()
+        self.feature_columns: List[str] = []
 
     # ------------------------------------------------------------------
     # Validation
@@ -89,18 +95,7 @@ class IPAFeatureEngineer:
 
     @staticmethod
     def _load_price_points_from_json(json_path: str) -> List[Tuple[str, float]]:
-        """Load IPA price points from external JSON file.
-
-        Parameters
-        ----------
-        json_path : str
-            Absolute path to the JSON file containing price data.
-
-        Returns
-        -------
-        list[tuple[str, float]]
-            List of (date_str, price) tuples.
-        """
+        """Load (date, price) pairs from a price JSON file."""
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         entries = data.get('prices', [])
@@ -108,25 +103,8 @@ class IPAFeatureEngineer:
             raise ValueError(f"No price entries found in {json_path}")
         return [(entry['date'], entry['price']) for entry in entries]
 
-    def create_ipa_price_data(
-        self,
-        interpolation: str = 'cubic',
-        json_path: Optional[str] = None,
-    ) -> pd.DataFrame:
-        """Create weekly IPA price data from a monthly JSON price file.
-
-        Parameters
-        ----------
-        interpolation : str
-            Interpolation method for weekly resampling ('cubic' or 'linear').
-        json_path : str, optional
-            Path to JSON file. Defaults to ``Data/ipa_prices.json`` next to this module.
-
-        Returns
-        -------
-        pd.DataFrame
-            Weekly IPA price data with DatetimeIndex.
-        """
+    def load_monthly_prices(self, json_path: Optional[str] = None) -> pd.DataFrame:
+        """Monthly IPA prices (one row per month, index = first day of the month)."""
         json_path = json_path or _DEFAULT_IPA_JSON_PATH
         if not os.path.isfile(json_path):
             raise FileNotFoundError(
@@ -137,163 +115,94 @@ class IPAFeatureEngineer:
         price_points = self._load_price_points_from_json(json_path)
         print(f"[OK] Loaded IPA prices from: {json_path} ({len(price_points)} entries)")
 
-        dates = [pd.to_datetime(p[0]) for p in price_points]
-        prices = [p[1] for p in price_points]
+        monthly = pd.DataFrame(
+            {TARGET_COL: [float(p) for _, p in price_points]},
+            index=pd.to_datetime([d for d, _ in price_points]).to_period('M').to_timestamp(),
+        )
+        monthly.index.name = 'Date'
+        if monthly.index.has_duplicates:
+            raise ValueError(f"Duplicate months in {json_path}")
+        return self._validate_target_series(monthly, TARGET_COL)
 
-        ipa_df = pd.DataFrame({'IPA_Price_TWD': prices}, index=dates)
-        ipa_df.index.name = 'Date'
-        ipa_df = self._validate_target_series(ipa_df, 'IPA_Price_TWD')
+    @staticmethod
+    def quarterly_target(monthly: pd.DataFrame, target_col: str = TARGET_COL) -> pd.Series:
+        """Mean of the monthly prices of each calendar quarter.
 
-        # Interpolate to weekly data
-        ipa_weekly = ipa_df.resample('W-SUN').mean()
-        try:
-            ipa_weekly = ipa_weekly.interpolate(method=interpolation)
-        except Exception:
-            ipa_weekly = ipa_weekly.interpolate(method='linear')
-        ipa_weekly = ipa_weekly.ffill().bfill()
-        ipa_weekly = self._validate_target_series(ipa_weekly, 'IPA_Price_TWD')
-
-        return ipa_weekly
-
-    # ------------------------------------------------------------------
-    # Feature creation
-    # ------------------------------------------------------------------
-
-    def create_lag_features(
-        self,
-        df: pd.DataFrame,
-        target_col: str,
-        lags: Optional[List[int]] = None,
-    ) -> pd.DataFrame:
-        """Create lag features for *target_col*."""
-        lags = lags if lags is not None else DEFAULT_LAG_PERIODS
-        result = df.copy()
-        for lag in lags:
-            result[f'{target_col}_lag{lag}'] = result[target_col].shift(lag)
-        return result
-
-    def create_rolling_features(
-        self,
-        df: pd.DataFrame,
-        target_col: str,
-        windows: Optional[List[int]] = None,
-    ) -> pd.DataFrame:
-        """Create rolling statistics features (mean, std, max, min)."""
-        windows = windows if windows is not None else DEFAULT_WEEKLY_ROLLING_WINDOWS
-        result = df.copy()
-        for window in windows:
-            result[f'{target_col}_ma{window}'] = result[target_col].rolling(window=window).mean()
-            result[f'{target_col}_std{window}'] = result[target_col].rolling(window=window).std()
-            result[f'{target_col}_max{window}'] = result[target_col].rolling(window=window).max()
-            result[f'{target_col}_min{window}'] = result[target_col].rolling(window=window).min()
-        return result
-
-    def create_change_features(
-        self,
-        df: pd.DataFrame,
-        target_col: str,
-        monthly_period: int = 4,
-        quarterly_period: int = 13,
-    ) -> pd.DataFrame:
-        """Create rate-of-change features."""
-        result = df.copy()
-        result[f'{target_col}_pct_change'] = result[target_col].pct_change()
-        result[f'{target_col}_monthly_change'] = result[target_col].pct_change(periods=monthly_period)
-        result[f'{target_col}_quarterly_change'] = result[target_col].pct_change(periods=quarterly_period)
-        return result
-
-    def create_time_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Create time-based features with cyclical encoding."""
-        result = df.copy()
-
-        result['Year'] = result.index.year
-        result['Month'] = result.index.month
-        result['Quarter'] = result.index.quarter
-        result['Week'] = result.index.isocalendar().week.astype(int)
-
-        # Seasonal encoding (sine/cosine)
-        result['Month_sin'] = np.sin(2 * np.pi * result['Month'] / 12)
-        result['Month_cos'] = np.cos(2 * np.pi * result['Month'] / 12)
-        result['Quarter_sin'] = np.sin(2 * np.pi * result['Quarter'] / 4)
-        result['Quarter_cos'] = np.cos(2 * np.pi * result['Quarter'] / 4)
-
-        return result
-
-    def create_exogenous_features(
-        self,
-        df: pd.DataFrame,
-        windows: Optional[List[int]] = None,
-    ) -> pd.DataFrame:
-        """Create lag and rolling features for exogenous variables, plus interaction features."""
-        windows = windows or DEFAULT_EXOGENOUS_WINDOWS
-        result = df.copy()
-
-        for col in EXOGENOUS_COLS:
-            if col not in result.columns:
-                continue
-            result[f'{col}_lag1'] = result[col].shift(1)
-            for w in windows:
-                result[f'{col}_ma{w}'] = result[col].rolling(window=w, min_periods=1).mean()
-
-        for col_a, col_b in INTERACTION_PAIRS:
-            if col_a in result.columns and col_b in result.columns:
-                result[f'{col_a}_x_{col_b}'] = result[col_a] * result[col_b]
-
-        return result
+        Quarters with fewer than three monthly prices are dropped, so every target is the
+        average of the same three months and depends on nothing outside its quarter.
+        """
+        grouped = monthly[target_col].resample('QE')
+        means, counts = grouped.mean(), grouped.count()
+        incomplete = counts.index[counts < 3]
+        if len(incomplete):
+            logger.warning("Dropping %d incomplete quarter(s): %s", len(incomplete),
+                           [str(q.to_period('Q')) for q in incomplete])
+        return means[counts == 3].rename(target_col)
 
     # ------------------------------------------------------------------
     # Resample
     # ------------------------------------------------------------------
 
-    def resample_to_quarterly(
-        self,
-        df: pd.DataFrame,
-        target_col: str = 'IPA_Price_TWD',
-    ) -> pd.DataFrame:
-        """Convert weekly data to quarterly averages."""
+    @staticmethod
+    def resample_to_quarterly(df: pd.DataFrame) -> pd.DataFrame:
+        """Quarterly means of the numeric columns (e.g. daily market data and event flags)."""
         numeric_cols = df.select_dtypes(include=[np.number]).columns
-        quarterly = df[numeric_cols].resample('QE').mean()
-        quarterly['Quarter_Label'] = quarterly.index.to_period('Q').astype(str)
-        return quarterly
+        return df[numeric_cols].resample('QE').mean()
 
     # ------------------------------------------------------------------
-    # Full pipelines
+    # Features
     # ------------------------------------------------------------------
 
-    def prepare_features(
-        self,
-        df: pd.DataFrame,
-        target_col: str = 'IPA_Price_TWD',
-    ) -> pd.DataFrame:
-        """Complete weekly feature engineering pipeline."""
-        print("Starting feature engineering...")
-        df = self._validate_target_series(df, target_col)
+    @staticmethod
+    def build_quarterly_features(base: pd.DataFrame, target_col: str = TARGET_COL) -> pd.DataFrame:
+        """Features of every quarter of *base*, each built from earlier quarters only.
 
-        print("  - Creating lag features...")
-        df = self.create_lag_features(df, target_col)
-        print("  - Creating rolling statistics features...")
-        df = self.create_rolling_features(df, target_col)
-        print("  - Creating rate of change features...")
-        df = self.create_change_features(df, target_col)
-        print("  - Creating time features...")
-        df = self.create_time_features(df)
-        print("  - Creating exogenous derived features...")
-        df = self.create_exogenous_features(df)
+        *base* has one row per quarter: the target (NaN for quarters to be forecast) and the
+        quarterly means of the exogenous drivers. Market drivers enter as their previous-quarter
+        value and rolling means of earlier quarters; any other column (event indicators) enters
+        as its previous-quarter value.
+        """
+        y = base[target_col].astype(float)
+        past = y.shift(1)
+        features: Dict[str, pd.Series] = {}
 
-        df = df.dropna()
-        print(f"[OK] Feature engineering complete! Total {len(df.columns)} features")
-        return df
+        for k in TARGET_LAGS:
+            features[f'{target_col}_lag{k}'] = y.shift(k)
+        for w in TARGET_WINDOWS:
+            window = past.rolling(window=w, min_periods=w)
+            features[f'{target_col}_ma{w}'] = window.mean()
+            features[f'{target_col}_std{w}'] = window.std()
+            features[f'{target_col}_max{w}'] = window.max()
+            features[f'{target_col}_min{w}'] = window.min()
+        for name, k in TARGET_CHANGES.items():
+            features[f'{target_col}_{name}'] = past / y.shift(1 + k) - 1
+
+        market = [c for c in EXOGENOUS_COLS if c in base.columns]
+        other = [c for c in base.columns if c != target_col and c not in market]
+        for col in market:
+            previous = base[col].astype(float).shift(1)
+            features[f'{col}_lag1'] = previous
+            for w in EXOGENOUS_WINDOWS:
+                features[f'{col}_ma{w}'] = previous.rolling(window=w, min_periods=w).mean()
+        for col in other:
+            features[f'{col}_lag1'] = base[col].astype(float).shift(1)
+        for col_a, col_b in INTERACTION_PAIRS:
+            if col_a in market and col_b in market:
+                features[f'{col_a}_x_{col_b}_lag1'] = (
+                    base[col_a].astype(float).shift(1) * base[col_b].astype(float).shift(1)
+                )
+
+        quarter = np.asarray(base.index.quarter, dtype=float)
+        features['Quarter_sin'] = pd.Series(np.sin(2 * np.pi * quarter / 4), index=base.index)
+        features['Quarter_cos'] = pd.Series(np.cos(2 * np.pi * quarter / 4), index=base.index)
+        return pd.DataFrame(features, index=base.index)
 
     def prepare_quarterly_features(
         self,
         quarterly_df: pd.DataFrame,
-        target_col: str = 'IPA_Price_TWD',
+        target_col: str = TARGET_COL,
     ) -> pd.DataFrame:
-        """Quarterly-first feature engineering pipeline.
-
-        Avoids averaging already-derived weekly lag/rolling features into quarter
-        buckets, which can distort time semantics.
-        """
+        """Training table: the target and the features of every quarter that has both."""
         print("Starting quarterly feature engineering...")
         df = self._validate_target_series(quarterly_df.copy(), target_col)
 
@@ -307,15 +216,13 @@ class IPAFeatureEngineer:
                 f"incomplete download was saved to the cache."
             )
 
-        df = self.create_lag_features(df, target_col, lags=DEFAULT_LAG_PERIODS)
-        df = self.create_rolling_features(df, target_col, windows=DEFAULT_QUARTERLY_ROLLING_WINDOWS)
-        df = self.create_change_features(df, target_col, monthly_period=2, quarterly_period=4)
-        df = self.create_time_features(df)
-        df = self.create_exogenous_features(df, windows=DEFAULT_QUARTERLY_EXOGENOUS_WINDOWS)
-        df = df.dropna()
+        features = self.build_quarterly_features(df, target_col)
+        self.feature_columns = list(features.columns)
+        table = features.join(df[[target_col]]).dropna()
 
-        print(f"[OK] Quarterly feature engineering complete! Total {len(df.columns)} features")
-        return df
+        print(f"[OK] Quarterly feature engineering complete! {len(self.feature_columns)} features, "
+              f"{len(table)} quarters")
+        return table
 
     # ------------------------------------------------------------------
     # Scaling
@@ -349,18 +256,7 @@ class IPAFeatureEngineer:
 # Main test program
 if __name__ == "__main__":
     fe = IPAFeatureEngineer()
-
-    print("Creating IPA price data from chart...")
-    ipa_data = fe.create_ipa_price_data()
-    print(f"Weekly data count: {len(ipa_data)}")
-    print(ipa_data.head(10))
-    print(ipa_data.tail(10))
-
-    featured_data = fe.prepare_features(ipa_data)
-    print(f"\nData count after feature engineering: {len(featured_data)}")
-    print("Column list:")
-    print(featured_data.columns.tolist())
-
-    quarterly = fe.resample_to_quarterly(featured_data)
-    print(f"\nQuarterly data count: {len(quarterly)}")
-    print(quarterly.tail(10))
+    monthly_prices = fe.load_monthly_prices(SAMPLE_IPA_JSON_PATH)
+    target = fe.quarterly_target(monthly_prices)
+    table = fe.prepare_quarterly_features(target.to_frame())
+    print(table.tail())

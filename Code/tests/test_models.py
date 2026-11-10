@@ -64,6 +64,12 @@ class TestModelEvaluator:
         result = ModelEvaluator.evaluate(np.array([40]), np.array([40]), "Single")
         assert result['Direction_Accuracy'] == 0  # not enough data
 
+    def test_direction_relative_to_previous_actual(self):
+        result = ModelEvaluator.evaluate(
+            np.array([42.0, 41.0]), np.array([41.0, 40.0]), "Prev", y_prev=np.array([40.0, 42.0]),
+        )
+        assert result['Direction_Accuracy'] == pytest.approx(100.0)  # up/up, down/down
+
 
 # ---------------------------------------------------------------------------
 # XGBoostModel (or GradientBoosting fallback)
@@ -141,3 +147,22 @@ class TestARIMAModel:
         model = ARIMAModel()
         with pytest.raises(ValueError, match="not trained"):
             model.predict(4)
+
+    def test_one_step_ahead_uses_only_earlier_observations(self):
+        rng = np.random.default_rng(1)
+        y = np.cumsum(rng.normal(0.1, 0.5, 40)) + 40
+        model = ARIMAModel(order=(1, 1, 0), seasonal_order=(0, 0, 0, 4)).fit(y[:30])
+        pred = model.one_step_ahead(y, start=30)
+        assert len(pred) == 10
+        # changing quarter 35 and later must not change the predictions of quarters 30-35
+        y_changed = y.copy()
+        y_changed[35:] += 100
+        pred_changed = model.one_step_ahead(y_changed, start=30)
+        np.testing.assert_allclose(pred_changed[:6], pred[:6])
+        assert abs(pred_changed[6] - pred[6]) > 1  # quarter 36 does see quarter 35
+
+    def test_one_step_ahead_first_value_equals_forecast(self):
+        rng = np.random.default_rng(2)
+        y = np.cumsum(rng.normal(0.1, 0.5, 40)) + 40
+        model = ARIMAModel(order=(1, 1, 0), seasonal_order=(0, 0, 0, 4)).fit(y[:30])
+        assert model.one_step_ahead(y, start=30)[0] == pytest.approx(float(model.predict(1)[0]))

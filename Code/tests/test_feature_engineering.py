@@ -1,5 +1,9 @@
 """
 Unit tests for IPA Feature Engineering Module
+
+Besides the basic behaviour, these tests guard against look-ahead: the target of a quarter
+must depend only on that quarter's monthly prices, and every feature of a quarter only on
+earlier quarters.
 """
 
 import json
@@ -13,7 +17,7 @@ import pytest
 # Ensure the Code directory is on sys.path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from ipa_feature_engineering import SAMPLE_IPA_JSON_PATH, IPAFeatureEngineer
+from ipa_feature_engineering import SAMPLE_IPA_JSON_PATH, TARGET_COL, IPAFeatureEngineer
 
 
 # ---------------------------------------------------------------------------
@@ -25,14 +29,26 @@ def fe():
     return IPAFeatureEngineer()
 
 
+def _write_prices(tmp_path, prices, name="prices.json"):
+    path = tmp_path / name
+    path.write_text(json.dumps({"prices": [{"date": d, "price": p} for d, p in prices]}), encoding='utf-8')
+    return str(path)
+
+
 @pytest.fixture
-def sample_weekly_df():
-    """Minimal weekly IPA price DataFrame for testing."""
-    dates = pd.date_range('2020-01-05', periods=20, freq='W-SUN')
-    prices = np.linspace(40, 50, 20) + np.random.default_rng(42).normal(0, 0.5, 20)
-    df = pd.DataFrame({'IPA_Price_TWD': prices}, index=dates)
-    df.index.name = 'Date'
-    return df
+def quarterly_base():
+    """Quarterly table: price, two market drivers and an event flag (random, reproducible)."""
+    rng = np.random.default_rng(7)
+    dates = pd.date_range('2012-03-31', periods=40, freq='QE')
+    return pd.DataFrame(
+        {
+            TARGET_COL: 40 + np.cumsum(rng.normal(0, 1.5, len(dates))),
+            'WTI_Price': 70 + np.cumsum(rng.normal(0, 3, len(dates))),
+            'USD_TWD': 30 + np.cumsum(rng.normal(0, 0.3, len(dates))),
+            'COVID19': (np.arange(len(dates)) >= 32).astype(float),
+        },
+        index=dates,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -70,22 +86,13 @@ class TestValidateTargetSeries:
 
 
 # ---------------------------------------------------------------------------
-# JSON loading
+# Price loading and the quarterly target
 # ---------------------------------------------------------------------------
 
-class TestIPAPriceDataLoading:
+class TestPriceLoading:
     def test_load_from_json(self, fe, tmp_path):
-        json_data = {
-            "prices": [
-                {"date": "2020-01", "price": 40},
-                {"date": "2020-02", "price": 42},
-                {"date": "2020-03", "price": 44},
-            ]
-        }
-        json_file = tmp_path / "test_prices.json"
-        json_file.write_text(json.dumps(json_data), encoding='utf-8')
-
-        points = fe._load_price_points_from_json(str(json_file))
+        path = _write_prices(tmp_path, [("2020-01", 40), ("2020-02", 42), ("2020-03", 44)])
+        points = fe._load_price_points_from_json(path)
         assert len(points) == 3
         assert points[0] == ('2020-01', 40)
 
@@ -98,161 +105,87 @@ class TestIPAPriceDataLoading:
     def test_sample_file_is_synthetic_and_complete(self, fe):
         with open(SAMPLE_IPA_JSON_PATH, encoding='utf-8') as f:
             assert json.load(f)['synthetic'] is True
-        points = fe._load_price_points_from_json(SAMPLE_IPA_JSON_PATH)
-        # 13 years × 12 months = 156 entries
-        assert len(points) == 156
+        monthly = fe.load_monthly_prices(SAMPLE_IPA_JSON_PATH)
+        assert len(monthly) == 156  # 13 years x 12 months
+        assert len(fe.quarterly_target(monthly)) == 52
 
     def test_missing_price_file_raises(self, fe, tmp_path):
         with pytest.raises(FileNotFoundError, match="not included in this repository"):
-            fe.create_ipa_price_data(json_path=str(tmp_path / "missing.json"))
+            fe.load_monthly_prices(str(tmp_path / "missing.json"))
 
-    def test_create_ipa_price_data_returns_weekly(self, fe):
-        data = fe.create_ipa_price_data(interpolation='linear', json_path=SAMPLE_IPA_JSON_PATH)
-        assert isinstance(data.index, pd.DatetimeIndex)
-        assert 'IPA_Price_TWD' in data.columns
-        assert not data['IPA_Price_TWD'].isna().any()
-        # Weekly data should be significantly more than 156 monthly points
-        assert len(data) > 156
+    def test_duplicate_month_raises(self, fe, tmp_path):
+        path = _write_prices(tmp_path, [("2020-01", 40), ("2020-01", 41)])
+        with pytest.raises(ValueError, match="Duplicate months"):
+            fe.load_monthly_prices(path)
 
-    def test_create_ipa_price_data_with_custom_json(self, fe, tmp_path):
-        json_data = {
-            "prices": [
-                {"date": "2020-01", "price": 40},
-                {"date": "2020-02", "price": 42},
-                {"date": "2020-03", "price": 44},
-                {"date": "2020-04", "price": 46},
-            ]
-        }
-        json_file = tmp_path / "custom.json"
-        json_file.write_text(json.dumps(json_data), encoding='utf-8')
+    def test_quarterly_target_is_mean_of_three_months(self, fe, tmp_path):
+        path = _write_prices(tmp_path, [("2020-01", 40), ("2020-02", 42), ("2020-03", 47), ("2020-04", 50)])
+        target = fe.quarterly_target(fe.load_monthly_prices(path))
+        assert list(target.index.to_period('Q').astype(str)) == ['2020Q1']  # Q2 incomplete: dropped
+        assert target.iloc[0] == pytest.approx(43.0)
 
-        data = fe.create_ipa_price_data(interpolation='linear', json_path=str(json_file))
-        assert len(data) > 0
-        assert data['IPA_Price_TWD'].min() >= 39  # close to 40
+    def test_quarterly_target_ignores_the_next_quarter(self, fe, tmp_path):
+        # Cubic interpolation to a weekly grid made Q1 depend on the April price.
+        months = [(f"2020-{m:02d}", 40.0 + m) for m in range(1, 13)]
+        bumped = [(d, p + 10 if d == "2020-04" else p) for d, p in months]
+        base = fe.quarterly_target(fe.load_monthly_prices(_write_prices(tmp_path, months, "a.json")))
+        changed = fe.quarterly_target(fe.load_monthly_prices(_write_prices(tmp_path, bumped, "b.json")))
+        assert changed.iloc[0] == base.iloc[0]                       # Q1 unchanged
+        assert changed.iloc[1] == pytest.approx(base.iloc[1] + 10 / 3)  # Q2 moves by 10/3
 
 
 # ---------------------------------------------------------------------------
-# Lag features
+# Features: only earlier quarters
 # ---------------------------------------------------------------------------
 
-class TestLagFeatures:
-    def test_lag_columns_created(self, fe, sample_weekly_df):
-        result = fe.create_lag_features(sample_weekly_df, 'IPA_Price_TWD', lags=[1, 2])
-        assert 'IPA_Price_TWD_lag1' in result.columns
-        assert 'IPA_Price_TWD_lag2' in result.columns
+class TestQuarterlyFeatures:
+    def test_every_feature_uses_only_earlier_quarters(self, fe, quarterly_base):
+        """Changing quarter t and everything after it must leave the features of t unchanged."""
+        reference = fe.build_quarterly_features(quarterly_base)
+        rng = np.random.default_rng(0)
+        for t in range(1, len(quarterly_base)):
+            perturbed = quarterly_base.copy()
+            perturbed.iloc[t:] = perturbed.iloc[t:] * (1 + rng.uniform(0.2, 0.5, perturbed.iloc[t:].shape))
+            features = fe.build_quarterly_features(perturbed)
+            pd.testing.assert_series_equal(features.iloc[t], reference.iloc[t], check_names=False)
 
-    def test_lag_values_correct(self, fe, sample_weekly_df):
-        result = fe.create_lag_features(sample_weekly_df, 'IPA_Price_TWD', lags=[1])
-        # lag1 at row 1 should equal original value at row 0
-        assert result['IPA_Price_TWD_lag1'].iloc[1] == pytest.approx(
-            sample_weekly_df['IPA_Price_TWD'].iloc[0]
+    def test_no_contemporaneous_columns(self, fe, quarterly_base):
+        features = fe.build_quarterly_features(quarterly_base)
+        for col in quarterly_base.columns:
+            assert col not in features.columns
+
+    def test_definitions(self, fe, quarterly_base):
+        f = fe.build_quarterly_features(quarterly_base)
+        y = quarterly_base[TARGET_COL]
+        t = 20
+        assert f[f'{TARGET_COL}_lag1'].iloc[t] == y.iloc[t - 1]
+        assert f[f'{TARGET_COL}_ma4'].iloc[t] == pytest.approx(y.iloc[t - 4:t].mean())
+        assert f[f'{TARGET_COL}_std4'].iloc[t] == pytest.approx(y.iloc[t - 4:t].std())
+        assert f[f'{TARGET_COL}_chg1'].iloc[t] == pytest.approx(y.iloc[t - 1] / y.iloc[t - 2] - 1)
+        assert f[f'{TARGET_COL}_chg4'].iloc[t] == pytest.approx(y.iloc[t - 1] / y.iloc[t - 5] - 1)
+        wti = quarterly_base['WTI_Price']
+        assert f['WTI_Price_lag1'].iloc[t] == wti.iloc[t - 1]
+        assert f['WTI_Price_ma2'].iloc[t] == pytest.approx(wti.iloc[t - 2:t].mean())
+        assert f['COVID19_lag1'].iloc[t] == quarterly_base['COVID19'].iloc[t - 1]
+        assert f['WTI_Price_x_USD_TWD_lag1'].iloc[t] == pytest.approx(
+            wti.iloc[t - 1] * quarterly_base['USD_TWD'].iloc[t - 1]
         )
 
-    def test_lag_first_value_is_nan(self, fe, sample_weekly_df):
-        result = fe.create_lag_features(sample_weekly_df, 'IPA_Price_TWD', lags=[1])
-        assert np.isnan(result['IPA_Price_TWD_lag1'].iloc[0])
+    def test_forecast_row_matches_training_row(self, fe, quarterly_base):
+        """A quarter whose price is not yet known gets the same features as in training."""
+        training = fe.build_quarterly_features(quarterly_base)
+        for t in (12, 25, len(quarterly_base) - 1):
+            unknown = quarterly_base.iloc[:t + 1].copy()
+            unknown.iloc[t] = np.nan  # price and drivers of the quarter being forecast
+            forecast = fe.build_quarterly_features(unknown)
+            pd.testing.assert_series_equal(forecast.iloc[t], training.iloc[t], check_names=False)
 
-
-# ---------------------------------------------------------------------------
-# Rolling features
-# ---------------------------------------------------------------------------
-
-class TestRollingFeatures:
-    def test_rolling_columns_created(self, fe, sample_weekly_df):
-        result = fe.create_rolling_features(sample_weekly_df, 'IPA_Price_TWD', windows=[4])
-        for suffix in ['ma4', 'std4', 'max4', 'min4']:
-            assert f'IPA_Price_TWD_{suffix}' in result.columns
-
-    def test_rolling_mean_correct(self, fe, sample_weekly_df):
-        result = fe.create_rolling_features(sample_weekly_df, 'IPA_Price_TWD', windows=[4])
-        # rolling mean at index 3 should be mean of first 4 values
-        expected = sample_weekly_df['IPA_Price_TWD'].iloc[:4].mean()
-        assert result['IPA_Price_TWD_ma4'].iloc[3] == pytest.approx(expected)
-
-
-# ---------------------------------------------------------------------------
-# Change features
-# ---------------------------------------------------------------------------
-
-class TestChangeFeatures:
-    def test_change_columns_created(self, fe, sample_weekly_df):
-        result = fe.create_change_features(sample_weekly_df, 'IPA_Price_TWD')
-        assert 'IPA_Price_TWD_pct_change' in result.columns
-        assert 'IPA_Price_TWD_monthly_change' in result.columns
-        assert 'IPA_Price_TWD_quarterly_change' in result.columns
-
-
-# ---------------------------------------------------------------------------
-# Time features
-# ---------------------------------------------------------------------------
-
-class TestTimeFeatures:
-    def test_time_columns_created(self, fe, sample_weekly_df):
-        result = fe.create_time_features(sample_weekly_df)
-        for col in ['Year', 'Month', 'Quarter', 'Week', 'Month_sin', 'Month_cos',
-                     'Quarter_sin', 'Quarter_cos']:
-            assert col in result.columns
-
-    def test_sin_cos_range(self, fe, sample_weekly_df):
-        result = fe.create_time_features(sample_weekly_df)
-        assert result['Month_sin'].between(-1, 1).all()
-        assert result['Quarter_cos'].between(-1, 1).all()
-
-
-# ---------------------------------------------------------------------------
-# Exogenous features
-# ---------------------------------------------------------------------------
-
-class TestExogenousFeatures:
-    def test_exogenous_lag_and_rolling_created(self, fe):
-        dates = pd.date_range('2020-01-05', periods=20, freq='W-SUN')
-        df = pd.DataFrame({
-            'IPA_Price_TWD': np.linspace(40, 50, 20),
-            'WTI_Price': np.linspace(60, 80, 20),
-            'USD_TWD': np.linspace(29, 31, 20),
-        }, index=dates)
-        result = fe.create_exogenous_features(df, windows=[4])
-        assert 'WTI_Price_lag1' in result.columns
-        assert 'WTI_Price_ma4' in result.columns
-        assert 'WTI_Price_x_USD_TWD' in result.columns
-
-    def test_missing_exogenous_cols_skipped(self, fe, sample_weekly_df):
-        result = fe.create_exogenous_features(sample_weekly_df, windows=[4])
-        # Should not fail even though no exogenous columns exist
-        assert len(result) == len(sample_weekly_df)
-
-
-# ---------------------------------------------------------------------------
-# Full pipeline
-# ---------------------------------------------------------------------------
-
-class TestPrepareFeaturesFullPipeline:
-    def test_prepare_features_runs(self, fe, sample_weekly_df):
-        result = fe.prepare_features(sample_weekly_df, 'IPA_Price_TWD')
-        # After dropna, should have fewer rows than input
-        assert len(result) < len(sample_weekly_df)
-        assert 'IPA_Price_TWD' in result.columns
-
-    def test_resample_to_quarterly(self, fe, sample_weekly_df):
-        featured = fe.prepare_features(sample_weekly_df, 'IPA_Price_TWD')
-        quarterly = fe.resample_to_quarterly(featured)
-        assert 'Quarter_Label' in quarterly.columns
-        assert len(quarterly) <= len(featured)
-
-    def test_prepare_quarterly_features(self, fe):
-        dates = pd.date_range('2014-03-31', periods=44, freq='QE')
-        df = pd.DataFrame(
-            {
-                'IPA_Price_TWD': np.linspace(35, 55, len(dates)),
-                'WTI_Price': np.linspace(60, 90, len(dates)),
-                'USD_TWD': np.linspace(29, 33, len(dates)),
-            },
-            index=dates,
-        )
-        featured = fe.prepare_quarterly_features(df, 'IPA_Price_TWD')
-        assert len(featured) > 0
-        assert 'IPA_Price_TWD_lag1' in featured.columns
-        assert 'WTI_Price_lag1' in featured.columns
+    def test_prepare_quarterly_features(self, fe, quarterly_base):
+        table = fe.prepare_quarterly_features(quarterly_base, TARGET_COL)
+        assert TARGET_COL in table.columns
+        assert set(fe.feature_columns) | {TARGET_COL} == set(table.columns)
+        assert not table.isna().any().any()
+        assert table.index[0] == quarterly_base.index[8]  # 8-quarter window needs 8 earlier quarters
 
     def test_empty_exogenous_column_names_the_cause(self, fe):
         # A failed download leaves an all-NaN column; dropna() used to wipe every row.
@@ -267,6 +200,12 @@ class TestPrepareFeaturesFullPipeline:
         )
         with pytest.raises(ValueError, match=r"WTI_Price.*download most likely failed"):
             fe.prepare_quarterly_features(df, 'IPA_Price_TWD')
+
+    def test_resample_to_quarterly_means(self, fe):
+        days = pd.date_range('2020-01-01', '2020-06-30', freq='D')
+        df = pd.DataFrame({'WTI_Price': np.where(days.quarter == 1, 50.0, 70.0)}, index=days)
+        quarterly = fe.resample_to_quarterly(df)
+        assert list(quarterly['WTI_Price']) == [50.0, 70.0]
 
 
 # ---------------------------------------------------------------------------
